@@ -5,6 +5,9 @@
 //! then `scores = embeddings_queries @ embeddings_documents.T`.
 //!
 //! Input text is loaded from `data/input/` (via `include_str!`) so it stays identical to the files on disk.
+//!
+//! Throughout this file, `//` blocks quote the upstream **Example Usage** on the model card
+//! (<https://huggingface.co/nvidia/llama-nv-embed-reasoning-3b#example-usage>) next to the Rust that mirrors it.
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
@@ -15,6 +18,16 @@ use rvllm_config::{
 use rvllm_core::types::Dtype;
 use rvllm_engine::GpuLLMEngine;
 use rvllm_tokenizer::Tokenizer;
+
+// --- Python (model card): raw `queries` / `documents` lists ------------------------------------
+// queries = [
+//     "how much protein should a female eat",
+//     "summit define",
+// ]
+// documents = [
+//     "As a general guideline, the CDC's average requirement of protein for women ages 19 to 70 is 46 grams per day. But, as you can see from this chart, you'll need to increase that if you're expecting or training for a marathon. Check out the chart below to see how much protein you should be eating each day.",
+//     "Definition of summit for English Language Learners. : 1  the highest point of a mountain : the top of a mountain. : 2  the highest level. : 3  a meeting or series of meetings between the leaders of two or more governments.",
+// ]
 
 // --- Model card strings (must match `data/input/**` byte-for-byte) --------------------------------
 
@@ -35,9 +48,23 @@ const PASSAGE_P02: &str = include_str!(concat!(
     "/data/input/passage/p02.txt"
 ));
 
+// Python (model card):
+// query_prefix = "query:"
+// document_prefix = "passage:"
+// queries = [f"{query_prefix} {query}" for query in queries]
+// documents = [f"{document_prefix} {document}" for document in documents]
+
 /// Prefixes match the card: `query_prefix = "query:"`, `document_prefix = "passage:"`, then `f"{prefix} {text}"`.
 const QUERY_PREFIX: &str = "query: ";
 const PASSAGE_PREFIX: &str = "passage: ";
+
+// Python (model card) — reference matrix from `print(scores.tolist())` in that example:
+// # Compute similarity scores
+// scores = (embeddings_queries @ embeddings_documents.T)
+// print("\nSimilarity scores:")
+// print(scores.tolist())
+// # Similarity scores:
+// # [[0.6688634157180786, 0.23073062300682068], [0.24395054578781128, 0.5622682571411133]]
 
 /// Reference printout from the model card (`# Compute similarity scores` → `scores.tolist()`).
 /// This is **transformers + CUDA** as shown on the card, not rvllm.
@@ -49,10 +76,26 @@ const MODEL_CARD_TRANSFORMERS_SCORES: [[f64; 2]; 2] = [
 const QUERY_IDS: [&str; 2] = ["q01", "q02"];
 const PASSAGE_IDS: [&str; 2] = ["p01", "p02"];
 
+// Python (model card) — top of Example Usage (after imports, before `queries` / `documents`):
+// import torch
+// import torch.nn.functional as F
+// from transformers import AutoTokenizer, AutoModel
+//
+// def average_pool(last_hidden_states, attention_mask):
+//     """Average pooling with attention mask."""
+//     last_hidden_states_masked = last_hidden_states.masked_fill(~attention_mask[..., None].bool(), 0.0)
+//     embedding = last_hidden_states_masked.sum(dim=1) / attention_mask.sum(dim=1)[..., None]
+//     embedding = F.normalize(embedding, dim=-1)
+//     return embedding
+
 // --- CLI (mirrors `embed-in-process embed` tuning knobs; duplicated on purpose) --------------------
 
 #[derive(Parser)]
-#[command(name = "hf-embed-card", version, about = "Model-card embedding smoke test (rvllm vs card reference)")]
+#[command(
+    name = "hf-embed-card",
+    version,
+    about = "Model-card embedding smoke test (rvllm vs card reference)"
+)]
 struct Cli {
     #[arg(long, default_value = "nvidia/llama-nv-embed-reasoning-3b")]
     model: String,
@@ -85,6 +128,9 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Python: `queries` / `documents` are the raw lists above; prefixed lists are built with:
+    // queries = [f"{query_prefix} {query}" for query in queries]
+    // documents = [f"{document_prefix} {document}" for document in documents]
     let queries_raw = [QUERY_Q01, QUERY_Q02];
     let passages_raw = [PASSAGE_P01, PASSAGE_P02];
 
@@ -97,6 +143,12 @@ fn main() -> Result<()> {
         .map(|t| format!("{PASSAGE_PREFIX}{t}"))
         .collect();
 
+    // Python (model card) — continues after `average_pool` and the query/passage lists:
+    // model_name = "nvidia/llama-nv-embed-reasoning-3b"
+    // tokenizer = AutoTokenizer.from_pretrained(model_name)
+    // model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
+    // model = model.to("cuda:0")
+    // model.eval()
     let config = build_engine_config(
         cli.model.clone(),
         cli.tokenizer.clone(),
@@ -119,6 +171,11 @@ fn main() -> Result<()> {
     let tok_path = cli.tokenizer.as_deref().unwrap_or(cli.model.as_str());
     let tokenizer = Tokenizer::from_pretrained(tok_path).map_err(|e| anyhow!("tokenizer: {e}"))?;
 
+    // Python (model card) — `average_pool` is defined above (with imports); rvllm applies pool+normalize inside `embed`.
+    // batch_queries = tokenizer(queries, padding=True, truncation=True, return_tensors='pt').to("cuda:0")
+    // with torch.no_grad():
+    //     outputs_queries = model(**batch_queries)
+    // embeddings_queries = average_pool(outputs_queries.last_hidden_state, batch_queries["attention_mask"])
     let mut query_emb: Vec<Vec<f32>> = Vec::with_capacity(2);
     for (i, full) in queries_prefixed.iter().enumerate() {
         let token_ids = tokenizer
@@ -131,6 +188,11 @@ fn main() -> Result<()> {
         query_emb.push(v);
     }
 
+    // Python (model card):
+    // batch_documents = tokenizer(documents, padding=True, truncation=True, return_tensors='pt').to("cuda:0")
+    // with torch.no_grad():
+    //     outputs_documents = model(**batch_documents)
+    // embeddings_documents = average_pool(outputs_documents.last_hidden_state, batch_documents["attention_mask"])
     let mut passage_emb: Vec<Vec<f32>> = Vec::with_capacity(2);
     for (i, full) in passages_prefixed.iter().enumerate() {
         let token_ids = tokenizer
@@ -143,16 +205,16 @@ fn main() -> Result<()> {
         passage_emb.push(v);
     }
 
+    // Python (model card):
+    // scores = (embeddings_queries @ embeddings_documents.T)
     let mut rvllm_scores = [[0f64; 2]; 2];
     for i in 0..2 {
         for j in 0..2 {
-            rvllm_scores[i][j] = f64::from(dot_product(
-                &query_emb[i],
-                &passage_emb[j],
-            ));
+            rvllm_scores[i][j] = f64::from(dot_product(&query_emb[i], &passage_emb[j]));
         }
     }
 
+    // Python only prints `scores.tolist()`; below we also compare to the frozen matrix on the card.
     println!("nvidia/llama-nv-embed-reasoning-3b — model card example (Rust / rvllm)\n");
     println!("Reference (transformers, printed on the model card):");
     println!("{:?}\n", MODEL_CARD_TRANSFORMERS_SCORES);
@@ -206,10 +268,7 @@ fn main() -> Result<()> {
     }
     println!("{}", "-".repeat(100));
 
-    let max_abs = abs_diffs
-        .iter()
-        .copied()
-        .fold(0.0_f64, f64::max);
+    let max_abs = abs_diffs.iter().copied().fold(0.0_f64, f64::max);
     let mean_abs: f64 = abs_diffs.iter().sum::<f64>() / 4.0;
     let rmse: f64 = (signed_diffs.iter().map(|x| x * x).sum::<f64>() / 4.0_f64).sqrt();
 
@@ -221,6 +280,8 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+// Dot product on L2-normalized embeddings matches the matrix multiply in:
+// scores = (embeddings_queries @ embeddings_documents.T)
 fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     let mut s = 0.0f32;
     for i in 0..a.len() {
