@@ -355,6 +355,9 @@ pub struct GpuWorker {
     /// Constructed in init_cache() once cache geometry is known.
     #[cfg(feature = "cuda")]
     gpu_model_runner: Option<rvllm_model_runner::gpu_runner::GpuModelRunner>,
+    /// CPU `ModelRunner` for `LlamaBidirectionalModel` embedding checkpoints (no CUDA graph path).
+    #[cfg(feature = "cuda")]
+    cpu_embedding_runner: Option<rvllm_model_runner::ModelRunner>,
     /// CUDA graph runner for decode step capture/replay.
     graph_runner: GraphRunner,
     /// GpuStream wrapping the main compute stream (same Arc as self.stream).
@@ -497,6 +500,8 @@ impl GpuWorker {
             raw_weight_shapes: None,
             #[cfg(feature = "cuda")]
             gpu_model_runner: None,
+            #[cfg(feature = "cuda")]
+            cpu_embedding_runner: None,
             graph_runner,
             #[cfg(feature = "cuda")]
             runner_stream,
@@ -534,7 +539,9 @@ impl GpuWorker {
             is_decode,
             DecodeGraphRuntimeState {
                 graphs_enabled: self.graph_runner.is_enabled(),
-                exact_graph_available: self.graph_runner.has_graph_for_exact(execution.graph_tokens),
+                exact_graph_available: self
+                    .graph_runner
+                    .has_graph_for_exact(execution.graph_tokens),
                 warmup_complete: self.forward_count > Self::GRAPH_WARMUP_CALLS,
                 capture_attempted: self
                     .graph_runner
@@ -649,10 +656,9 @@ impl GpuWorker {
             if dispatch.execution.use_batched_v2 {
                 match dispatch.action {
                     DecodeGraphAction::Replay => {
-                        let runner =
-                            self.gpu_model_runner.as_ref().ok_or_else(|| {
-                                LLMError::GpuError("GPU model runner not initialized".into())
-                            })?;
+                        let runner = self.gpu_model_runner.as_ref().ok_or_else(|| {
+                            LLMError::GpuError("GPU model runner not initialized".into())
+                        })?;
                         input::prepare_decode_batch_graph_reuse(
                             &mut self.decode_input_scratch,
                             decode_batch,
@@ -661,10 +667,9 @@ impl GpuWorker {
                         return self.replay_decode_graph(dispatch.execution, None);
                     }
                     DecodeGraphAction::Capture => {
-                        let runner =
-                            self.gpu_model_runner.as_ref().ok_or_else(|| {
-                                LLMError::GpuError("GPU model runner not initialized".into())
-                            })?;
+                        let runner = self.gpu_model_runner.as_ref().ok_or_else(|| {
+                            LLMError::GpuError("GPU model runner not initialized".into())
+                        })?;
                         input::prepare_decode_batch_graph_reuse(
                             &mut self.decode_input_scratch,
                             decode_batch,
@@ -677,7 +682,8 @@ impl GpuWorker {
                                     graph_batch = dispatch.execution.graph_tokens,
                                     "decode batch graph capture failed, falling back: {e}"
                                 );
-                                let model_input = input::model_input_from_decode_batch(decode_batch);
+                                let model_input =
+                                    input::model_input_from_decode_batch(decode_batch);
                                 self.gpu_forward_prepared_ex(&model_input, greedy_only)
                             }
                         };
@@ -793,6 +799,34 @@ impl GpuWorker {
                 self.install_qwen35_compat_weights_f16(&mut raw_map)?;
             }
             let raw_shapes = self.raw_weight_shapes.take().unwrap_or_default();
+
+            if self.config.architecture == "LlamaBidirectionalModel" {
+                let bridge = Self::cuda_weights_to_bridge(&self.stream, &raw_map, &raw_shapes)?;
+                let mr_cfg = self.runner_config.as_ref().ok_or_else(|| {
+                    LLMError::GpuError("init_model must be called before init_cache".into())
+                })?;
+                let cache_elements = self.config.num_kv_heads * self.config.head_dim * 16;
+                let cache = std::sync::Arc::new(rvllm_model_runner::bridge::CacheEngine::new(
+                    self.config.num_layers,
+                    cache_elements,
+                ));
+                let gpu: std::sync::Arc<dyn rvllm_model_runner::bridge::GpuAllocator> =
+                    rvllm_model_runner::bridge::MockGpuAllocator::new(1 << 30);
+                let attn = Box::new(
+                    rvllm_model_runner::attn_cpu::CpuBidirectionalAttention::new(
+                        self.config.num_attention_heads,
+                        self.config.num_kv_heads,
+                        self.config.head_dim,
+                    ),
+                );
+                let runner =
+                    rvllm_model_runner::ModelRunner::new(bridge, mr_cfg.clone(), attn, cache, gpu)
+                        .map_err(|e| LLMError::GpuError(format!("embedding ModelRunner: {e}")))?;
+                self.cpu_embedding_runner = Some(runner);
+                info!("LlamaBidirectionalModel: CPU embedding runner ready (bidirectional attention on CPU)");
+                return Ok(());
+            }
+
             let loader_weights = LoaderWeights::new(raw_map, raw_shapes);
 
             let block_size = self.config.block_size;
@@ -888,6 +922,53 @@ impl GpuWorker {
         Ok(())
     }
 
+    /// Mean-pool last hidden states and L2-normalize (NVIDIA embedding recipe).
+    #[cfg(feature = "cuda")]
+    pub fn compute_embedding(&self, token_ids: &[u32]) -> Result<Vec<f32>> {
+        let runner = self.cpu_embedding_runner.as_ref().ok_or_else(|| {
+            LLMError::ModelError(
+                "compute_embedding requires LlamaBidirectionalModel and init_cache".into(),
+            )
+        })?;
+        let n = token_ids.len();
+        if n == 0 {
+            return Err(LLMError::ModelError("empty token ids for embedding".into()));
+        }
+        let input = ModelInput {
+            token_ids: token_ids.to_vec(),
+            position_ids: (0..n as u32).collect(),
+            attention_metadata: rvllm_model_runner::bridge::AttentionMetadata {
+                slot_mapping: vec![0; n],
+                context_lens: vec![n as u32],
+                block_tables: vec![vec![0u32]; n],
+                query_lens: vec![1; n],
+                max_context_len: n as u32,
+            },
+            is_prefill: true,
+        };
+        let hidden = runner.execute_model(input)?;
+        let h = self.config.hidden_size;
+        let mut emb = vec![0.0f32; h];
+        for t in 0..n {
+            for j in 0..h {
+                emb[j] += hidden.data[t * h + j];
+            }
+        }
+        let inv = 1.0 / (n as f32);
+        for v in &mut emb {
+            *v *= inv;
+        }
+        let mut s = 0.0f32;
+        for &v in &emb {
+            s += v * v;
+        }
+        let invn = (s + 1e-12f32).sqrt().recip();
+        for v in &mut emb {
+            *v *= invn;
+        }
+        Ok(emb)
+    }
+
     /// Pre-capture CUDA graphs for common decode batch sizes at startup.
     /// Eliminates mid-generation graph capture stalls by populating the graph
     /// pool with pre-built graphs for standard bucket sizes.
@@ -945,7 +1026,12 @@ impl GpuWorker {
 
             // Warmup forward (outside capture)
             let upload_result = if plan.use_batched_v2 {
-                runner.upload_decode_metadata_v2(&token_ids, &positions, &attn_meta, plan.graph_tokens)
+                runner.upload_decode_metadata_v2(
+                    &token_ids,
+                    &positions,
+                    &attn_meta,
+                    plan.graph_tokens,
+                )
             } else if plan.graph_tokens == n {
                 runner.upload_metadata(&token_ids, &positions, &attn_meta)
             } else {
@@ -977,7 +1063,12 @@ impl GpuWorker {
 
             // Re-upload for capture
             let reupload_result = if plan.use_batched_v2 {
-                runner.upload_decode_metadata_v2(&token_ids, &positions, &attn_meta, plan.graph_tokens)
+                runner.upload_decode_metadata_v2(
+                    &token_ids,
+                    &positions,
+                    &attn_meta,
+                    plan.graph_tokens,
+                )
             } else if plan.graph_tokens == n {
                 runner.upload_metadata(&token_ids, &positions, &attn_meta)
             } else {
@@ -1196,6 +1287,44 @@ impl GpuWorker {
         std::env::var("HOME")
             .map(|h| std::path::PathBuf::from(h).join(".cache").join("rvllm"))
             .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/rvllm"))
+    }
+
+    /// Download CUDA f16 weights into the model-runner bridge format (for CPU embedding forward).
+    #[cfg(feature = "cuda")]
+    fn cuda_weights_to_bridge(
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        weights: &HashMap<String, cudarc::driver::CudaSlice<half::f16>>,
+        shapes: &HashMap<String, Vec<usize>>,
+    ) -> Result<rvllm_model_runner::bridge::ModelWeights> {
+        use half::f16;
+        use rvllm_model_runner::bridge::{ModelWeights, WeightTensor};
+        let mut out = ModelWeights::default();
+        for (name, slice) in weights {
+            let shape = shapes
+                .get(name)
+                .cloned()
+                .ok_or_else(|| LLMError::GpuError(format!("missing shape for weight {name}")))?;
+            let host: Vec<f16> = stream
+                .clone_dtoh(slice)
+                .map_err(|e| LLMError::GpuError(format!("dtoh {name}: {e}")))?;
+            let numel: usize = shape.iter().product();
+            if host.len() != numel {
+                return Err(LLMError::GpuError(format!(
+                    "shape mismatch for {name}: len {} vs numel {}",
+                    host.len(),
+                    numel
+                )));
+            }
+            out.tensors.insert(
+                name.clone(),
+                WeightTensor {
+                    name: name.clone(),
+                    data: host,
+                    shape,
+                },
+            );
+        }
+        Ok(out)
     }
 
     #[cfg(feature = "cuda")]
@@ -1561,7 +1690,8 @@ impl GpuWorker {
                 return Ok(None);
             }
         }
-        let greedy_only = decode_batch.map_or_else(|| Self::all_greedy(metadata), |b| b.all_greedy());
+        let greedy_only =
+            decode_batch.map_or_else(|| Self::all_greedy(metadata), |b| b.all_greedy());
         let fwd_output = if let Some(batch) = decode_batch {
             self.gpu_forward_from_decode_batch_ex(batch, greedy_only)?
         } else {
@@ -1653,7 +1783,8 @@ impl GpuWorker {
             }
         }
 
-        let greedy_only = decode_batch.map_or_else(|| Self::all_greedy(metadata), |b| b.all_greedy());
+        let greedy_only =
+            decode_batch.map_or_else(|| Self::all_greedy(metadata), |b| b.all_greedy());
         let fwd_output = if let Some(batch) = decode_batch {
             self.gpu_forward_from_decode_batch_ex(batch, greedy_only)?
         } else {
@@ -1711,7 +1842,8 @@ impl GpuWorker {
 
         let t_start = std::time::Instant::now();
 
-        let greedy_only = decode_batch.map_or_else(|| Self::all_greedy(metadata), |b| b.all_greedy());
+        let greedy_only =
+            decode_batch.map_or_else(|| Self::all_greedy(metadata), |b| b.all_greedy());
         let fwd_output = if let Some(batch) = decode_batch {
             self.gpu_forward_from_decode_batch_ex(batch, greedy_only)?
         } else {
@@ -1791,7 +1923,8 @@ impl GpuWorker {
             }
         }
 
-        let greedy_only = decode_batch.map_or_else(|| Self::all_greedy(metadata), |b| b.all_greedy());
+        let greedy_only =
+            decode_batch.map_or_else(|| Self::all_greedy(metadata), |b| b.all_greedy());
         let fwd_output = if let Some(batch) = decode_batch {
             self.gpu_forward_from_decode_batch_ex(batch, greedy_only)?
         } else {
@@ -2024,15 +2157,18 @@ impl GpuWorker {
                     DecodeGraphAction::Replay => {
                         self.replay_decode_graph(dispatch.execution, Some(model_input))
                     }
-                    DecodeGraphAction::Capture => match self
-                        .capture_decode_graph(dispatch.execution, Some(model_input))
-                    {
-                        Ok(output) => Ok(output),
-                        Err(e) => {
-                            warn!(graph_batch = dispatch.execution.graph_tokens, "graph capture failed, raw forward: {e}");
-                            self.raw_gpu_forward_ex(model_input, greedy_only)
+                    DecodeGraphAction::Capture => {
+                        match self.capture_decode_graph(dispatch.execution, Some(model_input)) {
+                            Ok(output) => Ok(output),
+                            Err(e) => {
+                                warn!(
+                                    graph_batch = dispatch.execution.graph_tokens,
+                                    "graph capture failed, raw forward: {e}"
+                                );
+                                self.raw_gpu_forward_ex(model_input, greedy_only)
+                            }
                         }
-                    },
+                    }
                 }
             }
 
@@ -2666,6 +2802,7 @@ fn worker_config_from_engine(
         attn_logit_softcapping: 0.0,
         num_local_experts: 0,
         num_experts_per_tok: 0,
+        rope_scaling: None,
     }
 }
 

@@ -56,6 +56,13 @@ pub trait InferenceEngine: Send + Sync {
         let _ = emit_intermediate;
         self.generate(prompt, params).await
     }
+
+    /// Native embedding forward (optional; `LlamaBidirectionalModel` on CUDA).
+    async fn embed(&self, _token_ids: Vec<u32>) -> rvllm_core::prelude::Result<Vec<f32>> {
+        Err(rvllm_core::prelude::LLMError::ModelError(
+            "embed not supported for this engine".into(),
+        ))
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -81,7 +88,12 @@ impl InferenceEngine for rvllm_engine::AsyncGpuLLMEngine {
         RequestId,
         tokio_stream::wrappers::ReceiverStream<rvllm_core::prelude::RequestOutput>,
     )> {
-        self.generate_with_mode(prompt, params, emit_intermediate).await
+        self.generate_with_mode(prompt, params, emit_intermediate)
+            .await
+    }
+
+    async fn embed(&self, token_ids: Vec<u32>) -> rvllm_core::prelude::Result<Vec<f32>> {
+        self.compute_embedding_vec(token_ids).await
     }
 }
 
@@ -229,28 +241,54 @@ impl rvllm_engine::Scheduler for MockScheduler {
     fn schedule(&mut self) -> rvllm_engine::SchedulerOutputs {
         let groups = self.groups.clone();
         self.groups.retain(|g| !g.is_finished());
-        let num_tokens = groups.iter().flat_map(|g| g.get_seqs()).map(|s| s.num_new_tokens().max(1)).sum();
-        rvllm_engine::SchedulerOutputs { scheduled_seq_groups: groups, num_batched_tokens: num_tokens, preempted: false }
+        let num_tokens = groups
+            .iter()
+            .flat_map(|g| g.get_seqs())
+            .map(|s| s.num_new_tokens().max(1))
+            .sum();
+        rvllm_engine::SchedulerOutputs {
+            scheduled_seq_groups: groups,
+            num_batched_tokens: num_tokens,
+            preempted: false,
+        }
     }
 
-    fn has_unfinished_seqs(&self) -> bool { !self.groups.is_empty() }
-    fn get_num_unfinished_seq_groups(&self) -> usize { self.groups.len() }
+    fn has_unfinished_seqs(&self) -> bool {
+        !self.groups.is_empty()
+    }
+    fn get_num_unfinished_seq_groups(&self) -> usize {
+        self.groups.len()
+    }
 }
 
 #[cfg(not(feature = "cuda"))]
-struct MockExecutor { calls: usize }
+struct MockExecutor {
+    calls: usize,
+}
 
 #[cfg(not(feature = "cuda"))]
-impl MockExecutor { fn new() -> Self { Self { calls: 0 } } }
+impl MockExecutor {
+    fn new() -> Self {
+        Self { calls: 0 }
+    }
+}
 
 #[cfg(not(feature = "cuda"))]
 impl rvllm_engine::Executor for MockExecutor {
-    fn execute_model(&mut self, input: rvllm_engine::ExecutorInput) -> rvllm_core::prelude::Result<Vec<rvllm_engine::SamplerOutput>> {
+    fn execute_model(
+        &mut self,
+        input: rvllm_engine::ExecutorInput,
+    ) -> rvllm_core::prelude::Result<Vec<rvllm_engine::SamplerOutput>> {
         self.calls += 1;
         let mut outputs = Vec::new();
         for meta in &input.seq_group_metadata {
             for &seq_id in meta.seq_data.keys() {
-                outputs.push(rvllm_engine::SamplerOutput { seq_id, token_id: if self.calls >= 8 { 0 } else { 1 }, logprob: -0.5, top_logprobs: None });
+                outputs.push(rvllm_engine::SamplerOutput {
+                    seq_id,
+                    token_id: if self.calls >= 8 { 0 } else { 1 },
+                    logprob: -0.5,
+                    top_logprobs: None,
+                });
             }
         }
         Ok(outputs)
@@ -265,10 +303,15 @@ fn build_mock_tokenizer() -> rvllm_tokenizer::Tokenizer {
     vocab.insert(" ".to_string(), 2);
     vocab.insert("!".to_string(), 3);
     vocab.insert("[UNK]".to_string(), 4);
-    let bpe = BPE::builder().vocab_and_merges(vocab, vec![]).unk_token("[UNK]".to_string()).build().unwrap();
+    let bpe = BPE::builder()
+        .vocab_and_merges(vocab, vec![])
+        .unk_token("[UNK]".to_string())
+        .build()
+        .unwrap();
     let mut hf = HfTokenizer::new(bpe);
     hf.with_pre_tokenizer(Some(Whitespace {}));
-    let path = std::env::temp_dir().join(format!("rvllm-mock-tokenizer-{}.json", std::process::id()));
+    let path =
+        std::env::temp_dir().join(format!("rvllm-mock-tokenizer-{}.json", std::process::id()));
     hf.save(&path, false).unwrap();
     let tok = rvllm_tokenizer::Tokenizer::from_file(&path).unwrap();
     let _ = std::fs::remove_file(&path);
@@ -309,7 +352,8 @@ pub async fn serve(config: EngineConfig) -> rvllm_core::prelude::Result<()> {
         {
             if !mock_mode {
                 return Err(rvllm_core::prelude::LLMError::GpuError(
-                    "no CUDA GPU detected; non-CUDA server mode currently supports mock-model only".into(),
+                    "no CUDA GPU detected; non-CUDA server mode currently supports mock-model only"
+                        .into(),
                 ));
             }
             info!("starting mock AsyncLLMEngine for non-CUDA smoke/integration flows");

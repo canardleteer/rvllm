@@ -867,6 +867,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
+name = "embed-in-process"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hex",
+ "rvllm-config",
+ "rvllm-core",
+ "rvllm-engine",
+ "rvllm-tokenizer",
+ "serde",
+ "serde_yaml",
+ "sha2",
+]
+
+[[package]]
 name = "encode_unicode"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1222,6 +1238,24 @@ name = "hermit-abi"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
+
+[[package]]
+name = "hex"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hf-embed-card"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "rvllm-config",
+ "rvllm-core",
+ "rvllm-engine",
+ "rvllm-tokenizer",
+]
 
 [[package]]
 name = "hf-hub"
@@ -2966,6 +3000,7 @@ dependencies = [
  "rvllm-core",
  "rvllm-executor",
  "rvllm-model-loader",
+ "rvllm-model-runner",
  "rvllm-scheduler",
  "rvllm-sequence",
  "rvllm-speculative",
@@ -3374,6 +3409,19 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "serde_yaml"
+version = "0.9.34+deprecated"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
 ]
 
 [[package]]
@@ -4077,6 +4125,12 @@ name = "unindent"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7264e107f553ccae879d21fbea1d6724ac785e8c3bfc762137959b5802826ef3"
+
+[[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"

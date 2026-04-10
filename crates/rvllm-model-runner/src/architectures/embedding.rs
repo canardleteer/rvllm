@@ -465,7 +465,10 @@ mod tests {
             vocab_size: 32,
             max_position: 512,
             dtype: rvllm_core::types::Dtype::Float16,
-            rms_norm_eps: 1e-5, rope_theta: 10000.0,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            partial_rotary_factor: 1.0,
+            rope_scaling: None,
             architecture: "EmbeddingModel".into(),
         }
     }
@@ -480,7 +483,7 @@ mod tests {
                 context_lens: vec![],
                 block_tables: vec![],
                 query_lens: vec![1],
-                    max_context_len: 0,
+                max_context_len: 0,
             },
             is_prefill: true,
         }

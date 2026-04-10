@@ -1,0 +1,5 @@
+# torch installed in Dockerfile with CUDA wheel; others here for local venv use
+transformers>=4.40
+PyYAML>=6
+accelerate>=0.27
+safetensors>=0.4

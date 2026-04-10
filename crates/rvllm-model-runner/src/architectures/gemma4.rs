@@ -191,7 +191,11 @@ impl Gemma4ForCausalLM {
             let is_moe = (i + 1) % moe_layer_freq == 0;
 
             let is_global = !is_moe;
-            let effective_head_dim = if is_global { global_head_dim } else { config.head_dim };
+            let effective_head_dim = if is_global {
+                global_head_dim
+            } else {
+                config.head_dim
+            };
 
             let input_layernorm = get_or_zeros(
                 &weights,
@@ -382,11 +386,8 @@ impl Architecture for Gemma4ForCausalLM {
 
             match layer {
                 Gemma4Layer::Dense(dense) => {
-                    let normed = GemmaRMSNorm::forward(
-                        &hidden,
-                        &dense.input_layernorm,
-                        self.rms_norm_eps,
-                    )?;
+                    let normed =
+                        GemmaRMSNorm::forward(&hidden, &dense.input_layernorm, self.rms_norm_eps)?;
 
                     let q = LinearLayer::forward(&normed, &dense.q_proj, None)?;
                     let k = LinearLayer::forward(&normed, &dense.k_proj, None)?;
@@ -506,6 +507,8 @@ mod tests {
             dtype: rvllm_core::types::Dtype::Float16,
             rms_norm_eps: 1e-6,
             rope_theta: 10000.0,
+            partial_rotary_factor: 1.0,
+            rope_scaling: None,
             architecture: "Gemma4ForCausalLM".into(),
         }
     }

@@ -42,6 +42,9 @@ pub struct EmbeddingRequest {
     /// Optional user identifier.
     #[serde(default)]
     pub user: Option<String>,
+    /// Optional `query` / `passage` hint for NVIDIA-style prefixes (see model card).
+    #[serde(default)]
+    pub task: Option<String>,
 }
 
 fn default_encoding_format() -> String {
@@ -70,6 +73,13 @@ impl EmbeddingRequest {
                 "unsupported encoding_format: '{}', expected 'float' or 'base64'",
                 self.encoding_format
             )));
+        }
+        if let Some(ref t) = self.task {
+            if t != "query" && t != "passage" {
+                return Err(ApiError::InvalidRequest(
+                    "task must be 'query', 'passage', or omitted".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -120,6 +130,21 @@ pub struct EmbeddingUsage {
     pub total_tokens: usize,
 }
 
+/// Prefix text for `task: "query"` / `"passage"` (same defaults as `embedding-sidecar`).
+fn apply_task_prefix(text: &str, task: Option<&str>) -> String {
+    match task {
+        Some("query") => {
+            let p = std::env::var("QUERY_PREFIX").unwrap_or_else(|_| "query: ".into());
+            format!("{p}{text}")
+        }
+        Some("passage") => {
+            let p = std::env::var("PASSAGE_PREFIX").unwrap_or_else(|_| "passage: ".into());
+            format!("{p}{text}")
+        }
+        _ => text.to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Handler
 // ---------------------------------------------------------------------------
@@ -153,48 +178,65 @@ pub async fn create_embeddings(
     let mut total_prompt_tokens = 0usize;
 
     for (idx, text) in texts.iter().enumerate() {
-        // Use the inference engine to get token-level output.
-        // For a real embedding model the engine forward pass returns hidden
-        // states (not logits). We use a minimal sampling config that generates
-        // 0 new tokens -- we only need the forward pass result.
-        let sampling = rvllm_core::prelude::SamplingParams {
-            max_tokens: 1,
-            temperature: 0.0,
-            ..Default::default()
-        };
+        let prefixed = apply_task_prefix(text, req.task.as_deref());
 
-        let (_request_id, mut output_stream) = state
-            .engine
-            .generate(text.to_string(), sampling)
-            .await
-            .map_err(ApiError::from)?;
+        #[cfg(feature = "cuda")]
+        {
+            let token_ids = {
+                let tok = state.tokenizer.read().await;
+                tok.encode(&prefixed).map_err(ApiError::from)?
+            };
+            let n_tok = token_ids.len();
+            let embedding = state
+                .engine
+                .embed(token_ids)
+                .await
+                .map_err(ApiError::from)?;
+            total_prompt_tokens += n_tok;
 
-        // Collect the final output.
-        let mut last_output = None;
-        while let Some(output) = tokio_stream::StreamExt::next(&mut output_stream).await {
-            if output.finished {
-                last_output = Some(output);
-                break;
-            }
-            last_output = Some(output);
+            data.push(EmbeddingObject {
+                object: "embedding".into(),
+                embedding,
+                index: idx,
+            });
         }
 
-        let output = last_output
-            .ok_or_else(|| ApiError::Internal("engine produced no output for embedding".into()))?;
+        #[cfg(not(feature = "cuda"))]
+        {
+            let sampling = rvllm_core::prelude::SamplingParams {
+                max_tokens: 1,
+                temperature: 0.0,
+                ..Default::default()
+            };
 
-        total_prompt_tokens += output.prompt_token_ids.len();
+            let (_request_id, mut output_stream) = state
+                .engine
+                .generate(prefixed, sampling)
+                .await
+                .map_err(ApiError::from)?;
 
-        // The engine output for an embedding model will contain the pooled
-        // embedding in the first completion output text (as a comma-separated
-        // float list) or as a placeholder. For the mock path we generate a
-        // deterministic embedding from the prompt token ids.
-        let embedding = mock_embedding_from_tokens(&output.prompt_token_ids);
+            let mut last_output = None;
+            while let Some(output) = tokio_stream::StreamExt::next(&mut output_stream).await {
+                if output.finished {
+                    last_output = Some(output);
+                    break;
+                }
+                last_output = Some(output);
+            }
 
-        data.push(EmbeddingObject {
-            object: "embedding".into(),
-            embedding,
-            index: idx,
-        });
+            let output = last_output.ok_or_else(|| {
+                ApiError::Internal("engine produced no output for embedding".into())
+            })?;
+
+            total_prompt_tokens += output.prompt_token_ids.len();
+            let embedding = mock_embedding_from_tokens(&output.prompt_token_ids);
+
+            data.push(EmbeddingObject {
+                object: "embedding".into(),
+                embedding,
+                index: idx,
+            });
+        }
     }
 
     Ok(Json(EmbeddingResponse {
@@ -213,6 +255,7 @@ pub async fn create_embeddings(
 /// In the real GPU path the embedding model's hidden states are pooled and
 /// normalised. This mock path produces a repeatable embedding vector
 /// for testing and development without a GPU.
+#[cfg(any(not(feature = "cuda"), test))]
 fn mock_embedding_from_tokens(token_ids: &[u32]) -> Vec<f32> {
     const DIM: usize = 384;
     let mut emb = vec![0.0f32; DIM];
@@ -245,12 +288,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn apply_task_prefix_defaults() {
+        assert_eq!(apply_task_prefix("hi", None), "hi");
+        assert_eq!(apply_task_prefix("hi", Some("query")), "query: hi");
+        assert_eq!(apply_task_prefix("hi", Some("passage")), "passage: hi");
+    }
+
+    #[test]
+    fn embedding_request_validate_bad_task() {
+        let req = EmbeddingRequest {
+            input: EmbeddingInput::Single("hello".into()),
+            model: "m".into(),
+            encoding_format: "float".into(),
+            user: None,
+            task: Some("other".into()),
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
     fn embedding_request_validate_ok() {
         let req = EmbeddingRequest {
             input: EmbeddingInput::Single("hello world".into()),
             model: "e5-small".into(),
             encoding_format: "float".into(),
             user: None,
+            task: None,
         };
         assert!(req.validate().is_ok());
     }
@@ -262,6 +325,7 @@ mod tests {
             model: "".into(),
             encoding_format: "float".into(),
             user: None,
+            task: None,
         };
         assert!(req.validate().is_err());
     }
@@ -273,6 +337,7 @@ mod tests {
             model: "m".into(),
             encoding_format: "float".into(),
             user: None,
+            task: None,
         };
         assert!(req.validate().is_err());
     }
@@ -284,6 +349,7 @@ mod tests {
             model: "m".into(),
             encoding_format: "float".into(),
             user: None,
+            task: None,
         };
         assert!(req.validate().is_err());
     }
@@ -295,6 +361,7 @@ mod tests {
             model: "m".into(),
             encoding_format: "binary".into(),
             user: None,
+            task: None,
         };
         assert!(req.validate().is_err());
     }
@@ -306,6 +373,7 @@ mod tests {
             model: "m".into(),
             encoding_format: "float".into(),
             user: None,
+            task: None,
         };
         assert_eq!(req.texts(), vec!["hello"]);
     }
@@ -317,6 +385,7 @@ mod tests {
             model: "m".into(),
             encoding_format: "float".into(),
             user: None,
+            task: None,
         };
         assert_eq!(req.texts(), vec!["a", "b"]);
     }
@@ -375,6 +444,37 @@ mod tests {
         let json = r#"{"input":["a","b"],"model":"e5"}"#;
         let req: EmbeddingRequest = serde_json::from_str(json).unwrap();
         assert!(matches!(req.input, EmbeddingInput::Batch(_)));
+    }
+
+    #[test]
+    fn embedding_request_serde_task_query() {
+        let json = r#"{"input":"x","model":"m","task":"query"}"#;
+        let req: EmbeddingRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.task.as_deref(), Some("query"));
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn embedding_request_serde_task_passage() {
+        let json = r#"{"input":"x","model":"m","task":"passage"}"#;
+        let req: EmbeddingRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.task.as_deref(), Some("passage"));
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn embedding_request_task_json_roundtrip() {
+        let req = EmbeddingRequest {
+            input: EmbeddingInput::Single("hello".into()),
+            model: "nv-embed".into(),
+            encoding_format: "float".into(),
+            user: None,
+            task: Some("query".into()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: EmbeddingRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.task, req.task);
+        assert_eq!(back.model, req.model);
     }
 
     #[test]

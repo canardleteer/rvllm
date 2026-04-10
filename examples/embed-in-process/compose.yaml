@@ -1,0 +1,46 @@
+# Parity harness: shared input/output + Hugging Face cache for Rust vs Python embedding pipelines.
+# From this directory: `export INPUT_DIR=... OUT_DIR=...` or rely on defaults under `./data/`.
+#
+# Build context for `embed-rust` is the repository root (see dockerfile path).
+
+services:
+  embed-rust:
+    build:
+      context: ../..
+      dockerfile: examples/embed-in-process/Dockerfile
+    image: rvllm-embed-in-process:local
+    volumes:
+      - ${INPUT_DIR:-./data/input}:/data/input:ro
+      - ${OUT_DIR:-./data/out}:/data/out
+      - hf-cache:/root/.cache/huggingface
+    environment:
+      - HF_TOKEN
+      - CUDA_VISIBLE_DEVICES=0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  embed-python:
+    build: ./python
+    image: rvllm-embed-ref:local
+    volumes:
+      - ${INPUT_DIR:-./data/input}:/data/input:ro
+      - ${OUT_DIR:-./data/out}:/data/out
+      - hf-cache:/root/.cache/huggingface
+    environment:
+      - HF_TOKEN
+      - CUDA_VISIBLE_DEVICES=0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  hf-cache:

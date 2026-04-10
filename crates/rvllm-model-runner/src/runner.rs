@@ -11,6 +11,16 @@ use crate::bridge::{
 };
 use crate::input::ModelInput;
 
+/// Optional HF `rope_scaling` block (e.g. Llama 3 long-context RoPE).
+#[derive(Debug, Clone)]
+pub struct RopeScalingConfig {
+    pub rope_type: String,
+    pub factor: f32,
+    pub low_freq_factor: f32,
+    pub high_freq_factor: f32,
+    pub original_max_position_embeddings: usize,
+}
+
 /// Static configuration for the model runner, derived from the model config.
 #[derive(Debug, Clone)]
 pub struct ModelRunnerConfig {
@@ -24,6 +34,9 @@ pub struct ModelRunnerConfig {
     pub max_position: usize,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
+    /// Fraction of `head_dim` that receives RoPE (Llama: 1.0).
+    pub partial_rotary_factor: f32,
+    pub rope_scaling: Option<RopeScalingConfig>,
     pub dtype: Dtype,
     pub architecture: String,
 }

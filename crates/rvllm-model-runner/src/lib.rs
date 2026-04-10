@@ -7,9 +7,11 @@
 //! implementations; real GPU kernels dispatch to CUDA.
 
 pub mod architectures;
+pub mod attn_cpu;
 pub mod bridge;
 pub mod input;
 pub mod layers;
+pub mod rope_llama3;
 pub mod runner;
 
 // GPU forward-pass modules (CUDA-only)
@@ -30,4 +32,4 @@ pub type CublasLtRef = ();
 
 pub use architectures::{create_model, Architecture};
 pub use input::ModelInput;
-pub use runner::{ModelRunner, ModelRunnerConfig};
+pub use runner::{ModelRunner, ModelRunnerConfig, RopeScalingConfig};

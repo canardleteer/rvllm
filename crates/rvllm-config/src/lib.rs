@@ -56,7 +56,12 @@ pub type Result<T> = std::result::Result<T, ConfigError>;
 fn config_file_sets_max_model_len(contents: &str) -> bool {
     toml::from_str::<toml::Value>(contents)
         .ok()
-        .and_then(|value| value.get("model").and_then(|model| model.get("max_model_len")).cloned())
+        .and_then(|value| {
+            value
+                .get("model")
+                .and_then(|model| model.get("max_model_len"))
+                .cloned()
+        })
         .is_some()
 }
 
@@ -266,6 +271,7 @@ log_level = "warn"
             trust_remote_code: false,
             block_size: 16,
             gpu_memory_utilization: 0.9,
+            gpu_memory_reserve_gb: 0.0,
             swap_space_gb: 4.0,
             num_gpu_blocks: None,
             num_cpu_blocks: None,
@@ -273,6 +279,7 @@ log_level = "warn"
             kv_cache_dtype: "auto".into(),
             max_num_seqs: 256,
             max_num_batched_tokens: 4096,
+            max_prefill_chunk: 128,
             max_paddings: 256,
             preemption_mode: "recompute".into(),
             tensor_parallel_size: 1,

@@ -28,6 +28,8 @@ members = [
     "crates/rvllm-fusion",
     "crates/rvllm-zig",
     "crates/rvllm-autotune",
+    "examples/embed-in-process",
+    "examples/hf-embed-card",
 ]
 
 [workspace.package]

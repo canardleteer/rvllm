@@ -184,7 +184,10 @@ impl NemotronHMoEForCausalLM {
 
     fn embed_tokens_flexible(&self, token_ids: &[u32]) -> GpuBuffer<f16> {
         let shape = &self.embed_tokens.shape;
-        if shape.len() == 2 && shape[0] == self.config.hidden_size && shape[1] == self.config.vocab_size {
+        if shape.len() == 2
+            && shape[0] == self.config.hidden_size
+            && shape[1] == self.config.vocab_size
+        {
             // GGUF orientation: [hidden, vocab]
             let mut out = Vec::with_capacity(token_ids.len() * self.config.hidden_size);
             for &tid in token_ids {
@@ -199,9 +202,16 @@ impl NemotronHMoEForCausalLM {
         }
     }
 
-    fn lm_head_flexible(&self, hidden: &GpuBuffer<f16>, num_tokens: usize) -> Result<GpuBuffer<f32>> {
+    fn lm_head_flexible(
+        &self,
+        hidden: &GpuBuffer<f16>,
+        num_tokens: usize,
+    ) -> Result<GpuBuffer<f32>> {
         let shape = &self.lm_head_weight.shape;
-        if shape.len() == 2 && shape[0] == self.config.hidden_size && shape[1] == self.config.vocab_size {
+        if shape.len() == 2
+            && shape[0] == self.config.hidden_size
+            && shape[1] == self.config.vocab_size
+        {
             let h = self.config.hidden_size;
             let mut logits = Vec::with_capacity(num_tokens * self.config.vocab_size);
             for t in 0..num_tokens {
@@ -215,9 +225,17 @@ impl NemotronHMoEForCausalLM {
                     logits.push(acc);
                 }
             }
-            Ok(GpuBuffer::from_vec(logits, vec![num_tokens, self.config.vocab_size]))
+            Ok(GpuBuffer::from_vec(
+                logits,
+                vec![num_tokens, self.config.vocab_size],
+            ))
         } else {
-            lm_head(hidden, &self.lm_head_weight, num_tokens, self.config.vocab_size)
+            lm_head(
+                hidden,
+                &self.lm_head_weight,
+                num_tokens,
+                self.config.vocab_size,
+            )
         }
     }
 
@@ -228,7 +246,11 @@ impl NemotronHMoEForCausalLM {
                 weight.shape
             )));
         }
-        let in_features = if input.shape.len() >= 2 { input.shape[1] } else { input.len() };
+        let in_features = if input.shape.len() >= 2 {
+            input.shape[1]
+        } else {
+            input.len()
+        };
         let a = weight.shape[0];
         let b = weight.shape[1];
         if b == in_features {
@@ -245,8 +267,16 @@ impl NemotronHMoEForCausalLM {
         }
     }
 
-    fn linear_forward(input: &GpuBuffer<f16>, weight: &GpuBuffer<f16>, transposed: bool) -> Result<GpuBuffer<f16>> {
-        let in_features = if input.shape.len() >= 2 { input.shape[1] } else { input.len() };
+    fn linear_forward(
+        input: &GpuBuffer<f16>,
+        weight: &GpuBuffer<f16>,
+        transposed: bool,
+    ) -> Result<GpuBuffer<f16>> {
+        let in_features = if input.shape.len() >= 2 {
+            input.shape[1]
+        } else {
+            input.len()
+        };
         let num_tokens = input.len() / in_features.max(1);
         let (out_features, weight_in) = if transposed {
             (weight.shape[1], weight.shape[0])
@@ -273,7 +303,11 @@ impl NemotronHMoEForCausalLM {
         Ok(GpuBuffer::from_vec(out, vec![num_tokens, out_features]))
     }
 
-    fn linear_expert(weight3: &GpuBuffer<f16>, expert_idx: usize, input: &GpuBuffer<f16>) -> Result<GpuBuffer<f16>> {
+    fn linear_expert(
+        weight3: &GpuBuffer<f16>,
+        expert_idx: usize,
+        input: &GpuBuffer<f16>,
+    ) -> Result<GpuBuffer<f16>> {
         if weight3.shape.len() != 3 {
             return Err(LLMError::ModelError(format!(
                 "nemotron expert weight expected 3D, got {:?}",
@@ -284,7 +318,10 @@ impl NemotronHMoEForCausalLM {
         let b = weight3.shape[1];
         let e = weight3.shape[2];
         if expert_idx >= e {
-            return Err(LLMError::ModelError(format!("expert index {} out of range {}", expert_idx, e)));
+            return Err(LLMError::ModelError(format!(
+                "expert index {} out of range {}",
+                expert_idx, e
+            )));
         }
         let chunk = a * b;
         let start = expert_idx * chunk;
@@ -297,7 +334,11 @@ impl NemotronHMoEForCausalLM {
         let normed = RMSNorm::forward(hidden, &ssm.norm_weight, 1e-5)?;
         let projected = Self::linear_flexible(&normed, &ssm.ssm_in)?;
         let internal_dim = if ssm.ssm_out.shape.len() == 2 {
-            if ssm.ssm_out.shape[1] == hidden.shape[1] { ssm.ssm_out.shape[0] } else { ssm.ssm_out.shape[1] }
+            if ssm.ssm_out.shape[1] == hidden.shape[1] {
+                ssm.ssm_out.shape[0]
+            } else {
+                ssm.ssm_out.shape[1]
+            }
         } else {
             hidden.shape[1]
         };
@@ -313,11 +354,30 @@ impl NemotronHMoEForCausalLM {
                     .and_then(|b| b.data.get(i % b.len()))
                     .map(|v| v.to_f32())
                     .unwrap_or(0.0);
-                let groups = ssm.ssm_dt_bias.as_ref().map(|b| b.len()).unwrap_or(1).max(1);
+                let groups = ssm
+                    .ssm_dt_bias
+                    .as_ref()
+                    .map(|b| b.len())
+                    .unwrap_or(1)
+                    .max(1);
                 let g = i % groups;
-                let dt = ssm.ssm_dt_bias.as_ref().map(|b| b.data[g].to_f32()).unwrap_or(0.0);
-                let a = ssm.ssm_a.as_ref().and_then(|b| b.data.get(g)).map(|v| v.to_f32()).unwrap_or(0.0);
-                let d = ssm.ssm_d.as_ref().and_then(|b| b.data.get(g)).map(|v| v.to_f32()).unwrap_or(0.0);
+                let dt = ssm
+                    .ssm_dt_bias
+                    .as_ref()
+                    .map(|b| b.data[g].to_f32())
+                    .unwrap_or(0.0);
+                let a = ssm
+                    .ssm_a
+                    .as_ref()
+                    .and_then(|b| b.data.get(g))
+                    .map(|v| v.to_f32())
+                    .unwrap_or(0.0);
+                let d = ssm
+                    .ssm_d
+                    .as_ref()
+                    .and_then(|b| b.data.get(g))
+                    .map(|v| v.to_f32())
+                    .unwrap_or(0.0);
                 let scale = 1.0 / (1.0 + (-(dt + d - a)).exp());
                 state[t * internal_dim + i] = f16::from_f32((src + conv_bias) * scale);
             }
@@ -389,12 +449,15 @@ impl Architecture for NemotronHMoEForCausalLM {
             trace!(layer = layer_idx, arch = %self.config.architecture, "nemotron layer forward");
 
             if let Some(attn) = &layer.attn {
-                let normed = RMSNorm::forward(&hidden, &attn.norm_weight, self.config.rms_norm_eps)?;
+                let normed =
+                    RMSNorm::forward(&hidden, &attn.norm_weight, self.config.rms_norm_eps)?;
                 let q = Self::linear_flexible(&normed, &attn.q_proj)?;
                 let k = Self::linear_flexible(&normed, &attn.k_proj)?;
                 let v = Self::linear_flexible(&normed, &attn.v_proj)?;
-                let (q_rot, k_rot) = RotaryEmbedding::forward(&input.position_ids, &q, &k, self.config.head_dim)?;
-                let attn_out = attention.forward(&q_rot, &k_rot, &v, &input.attention_metadata, layer_idx)?;
+                let (q_rot, k_rot) =
+                    RotaryEmbedding::forward(&input.position_ids, &q, &k, self.config.head_dim)?;
+                let attn_out =
+                    attention.forward(&q_rot, &k_rot, &v, &input.attention_metadata, layer_idx)?;
                 let attn_proj = Self::linear_flexible(&attn_out, &attn.o_proj)?;
                 add_inplace(&mut hidden, &attn_proj);
             }
@@ -418,7 +481,9 @@ impl Architecture for NemotronHMoEForCausalLM {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::{AttentionMetadata, MockAttentionBackend, ModelWeights, WeightTensor, CacheEngine};
+    use crate::bridge::{
+        AttentionMetadata, CacheEngine, MockAttentionBackend, ModelWeights, WeightTensor,
+    };
     use crate::input::ModelInput;
     use std::sync::Arc;
 
@@ -446,6 +511,8 @@ mod tests {
             max_position: 16,
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
+            partial_rotary_factor: 1.0,
+            rope_scaling: None,
             dtype: rvllm_core::types::Dtype::Float16,
             architecture: "nemotron_h_moe".to_string(),
         }

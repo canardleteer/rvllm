@@ -53,6 +53,8 @@ pub struct WorkerConfig {
     pub kv_cache_dtype: String,
     /// Enable prefix caching.
     pub enable_prefix_caching: bool,
+    /// Optional HF `rope_scaling` (Llama 3 long-context RoPE).
+    pub rope_scaling: Option<rvllm_model_runner::RopeScalingConfig>,
 }
 
 impl WorkerConfig {
@@ -71,6 +73,8 @@ impl WorkerConfig {
             dtype: self.dtype,
             architecture: self.architecture.clone(),
             rope_theta: self.rope_theta,
+            partial_rotary_factor: self.partial_rotary_factor,
+            rope_scaling: self.rope_scaling.clone(),
         }
     }
 

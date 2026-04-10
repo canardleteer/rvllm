@@ -243,6 +243,10 @@ impl ModelWeights {
             if let Some(t) = self.tensors.get(&alt) {
                 return Ok(t);
             }
+            // HF checkpoints that omit the `model.` prefix (e.g. some safetensors shards).
+            if let Some(t) = self.tensors.get(rest) {
+                return Ok(t);
+            }
         }
 
         if let Some(rest) = name.strip_prefix("lm_head.") {

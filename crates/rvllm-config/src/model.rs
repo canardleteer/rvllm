@@ -101,7 +101,7 @@ pub fn resolve_runtime_max_model_len(
 ) -> usize {
     if requested_was_explicit
         || requested != DEFAULT_MAX_MODEL_LEN
-        || architecture != "LlamaForCausalLM"
+        || (architecture != "LlamaForCausalLM" && architecture != "LlamaBidirectionalModel")
     {
         return requested;
     }

@@ -415,7 +415,10 @@ mod tests {
             vocab_size: 32,
             max_position: 128,
             dtype: rvllm_core::types::Dtype::Float16,
-            rms_norm_eps: 1e-5, rope_theta: 10000.0,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            partial_rotary_factor: 1.0,
+            rope_scaling: None,
             architecture: "DeepSeekV2ForCausalLM".into(),
         }
     }
@@ -429,7 +432,7 @@ mod tests {
                 context_lens: vec![3],
                 block_tables: vec![vec![0]],
                 query_lens: vec![1],
-                    max_context_len: 3,
+                max_context_len: 3,
             },
             is_prefill: true,
         }
@@ -476,7 +479,7 @@ mod tests {
                 context_lens: vec![1],
                 block_tables: vec![vec![0]],
                 query_lens: vec![1],
-                    max_context_len: 1,
+                max_context_len: 1,
             },
             is_prefill: false,
         };

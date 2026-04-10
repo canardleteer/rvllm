@@ -217,7 +217,9 @@ mod cuda_impl {
                 .borrow_mut()
                 .ensure_len(padded * max_blocks, stream)?;
             self.slot_mapping.borrow_mut().ensure_len(padded, stream)?;
-            self.seq_start_pos.borrow_mut().ensure_len(padded + 1, stream)?;
+            self.seq_start_pos
+                .borrow_mut()
+                .ensure_len(padded + 1, stream)?;
             Ok(())
         }
     }
@@ -226,16 +228,16 @@ mod cuda_impl {
     /// Sized for max_batch_tokens. Reused across all layers (sequential execution).
     pub struct F16LayerScratch {
         pub max_tokens: usize,
-        pub qkv: CudaSlice<f16>,      // [max_tokens * qkv_dim]
-        pub attn_out: CudaSlice<f16>, // [max_tokens * q_dim]
+        pub qkv: CudaSlice<f16>,            // [max_tokens * qkv_dim]
+        pub attn_out: CudaSlice<f16>,       // [max_tokens * q_dim]
         pub attn_split_out: CudaSlice<f32>, // [max_splits * max_tokens * q_dim]
         pub attn_split_max: CudaSlice<f32>, // [max_splits * max_tokens * num_heads]
         pub attn_split_sum: CudaSlice<f32>, // [max_splits * max_tokens * num_heads]
-        pub o_proj: CudaSlice<f16>,   // [max_tokens * hidden]
-        pub normed: CudaSlice<f16>,   // [max_tokens * hidden]
-        pub gate_up: CudaSlice<f16>,  // [max_tokens * intermediate * 2]
-        pub gateup_ws: CudaSlice<u8>, // CUTLASS gateup workspace
-        pub silu_out: CudaSlice<f16>, // [max_tokens * intermediate]
+        pub o_proj: CudaSlice<f16>,         // [max_tokens * hidden]
+        pub normed: CudaSlice<f16>,         // [max_tokens * hidden]
+        pub gate_up: CudaSlice<f16>,        // [max_tokens * intermediate * 2]
+        pub gateup_ws: CudaSlice<u8>,       // CUTLASS gateup workspace
+        pub silu_out: CudaSlice<f16>,       // [max_tokens * intermediate]
         // Double-buffered: layer N writes to pair A, reads from pair B.
         // Layer N+1 writes to pair B, reads from pair A. Zero alloc, zero copy.
         pub residual_a: CudaSlice<f16>, // [max_tokens * hidden]
@@ -293,7 +295,8 @@ mod cuda_impl {
         }
 
         fn observe_layer(&mut self, t: &BatchedLayerPhaseTimings) {
-            self.pre_attn_norm_ns.push(t.pre_attn_norm.as_nanos() as u64);
+            self.pre_attn_norm_ns
+                .push(t.pre_attn_norm.as_nanos() as u64);
             self.qkv_ns.push(t.qkv.as_nanos() as u64);
             self.rope_cache_ns.push(t.rope_cache.as_nanos() as u64);
             self.attn_ns.push(t.attn.as_nanos() as u64);
@@ -957,8 +960,11 @@ mod cuda_impl {
                     (intermediate * 2) as i32,
                     hidden as i32,
                 );
-                let gate_aux_ws =
-                    ck.gate_silu_mul_workspace_size(max_tokens as i32, intermediate as i32, hidden as i32);
+                let gate_aux_ws = ck.gate_silu_mul_workspace_size(
+                    max_tokens as i32,
+                    intermediate as i32,
+                    hidden as i32,
+                );
                 gateup_ws.max(gate_aux_ws).max(1)
             });
 
@@ -967,8 +973,12 @@ mod cuda_impl {
                 qkv: alloc(max_tokens * qkv_dim)?,
                 attn_out: alloc(max_tokens * q_dim)?,
                 attn_split_out: alloc_f32(MAX_DECODE_ATTENTION_SPLITS * max_tokens * q_dim)?,
-                attn_split_max: alloc_f32(MAX_DECODE_ATTENTION_SPLITS * max_tokens * self.config.num_heads)?,
-                attn_split_sum: alloc_f32(MAX_DECODE_ATTENTION_SPLITS * max_tokens * self.config.num_heads)?,
+                attn_split_max: alloc_f32(
+                    MAX_DECODE_ATTENTION_SPLITS * max_tokens * self.config.num_heads,
+                )?,
+                attn_split_sum: alloc_f32(
+                    MAX_DECODE_ATTENTION_SPLITS * max_tokens * self.config.num_heads,
+                )?,
                 o_proj: alloc(max_tokens * hidden)?,
                 normed: alloc(max_tokens * hidden)?,
                 gate_up: alloc(max_tokens * intermediate * 2)?,
@@ -1564,7 +1574,14 @@ mod cuda_impl {
             is_prefill: bool,
             greedy_only: bool,
         ) -> Result<ForwardOutput> {
-            self.forward_inner(token_ids, positions, attn_meta, is_prefill, greedy_only, None)
+            self.forward_inner(
+                token_ids,
+                positions,
+                attn_meta,
+                is_prefill,
+                greedy_only,
+                None,
+            )
         }
 
         pub fn profile_decode_bucket(
@@ -1972,7 +1989,11 @@ mod cuda_impl {
                     host.block_tables[row_base + blk_idx] = blk as i32;
                 }
             }
-            for (dst, &src) in host.slot_mapping.iter_mut().zip(attn_meta.slot_mapping.iter()) {
+            for (dst, &src) in host
+                .slot_mapping
+                .iter_mut()
+                .zip(attn_meta.slot_mapping.iter())
+            {
                 *dst = src as i32;
             }
             let mut seq_pos = 0i32;
@@ -2080,7 +2101,9 @@ mod cuda_impl {
                         &src_view,
                         &mut packed.slice_mut(seq_start_pos_off..seq_start_pos_off + padded + 1),
                     )
-                    .map_err(|e| LLMError::GpuError(format!("decode v2 seq_start_pos DtoD: {e}")))?;
+                    .map_err(|e| {
+                        LLMError::GpuError(format!("decode v2 seq_start_pos DtoD: {e}"))
+                    })?;
             }
 
             self.meta_packed_offsets.set(PackedMetaOffsets {
@@ -2280,7 +2303,9 @@ mod cuda_impl {
                         &src_view,
                         &mut packed.slice_mut(seq_start_pos_off..seq_start_pos_off + padded + 1),
                     )
-                    .map_err(|e| LLMError::GpuError(format!("decode v2 seq_start_pos DtoD: {e}")))?;
+                    .map_err(|e| {
+                        LLMError::GpuError(format!("decode v2 seq_start_pos DtoD: {e}"))
+                    })?;
             }
 
             self.meta_packed_offsets.set(PackedMetaOffsets {
@@ -2652,9 +2677,7 @@ mod cuda_impl {
             let path = self.resolve_forward_path(num_tokens, is_prefill);
             ForwardExecutionPlan {
                 path,
-                use_scratch: num_tokens > 1
-                    || is_prefill
-                    || matches!(path, ForwardPath::BatchedV2),
+                use_scratch: num_tokens > 1 || is_prefill || matches!(path, ForwardPath::BatchedV2),
                 graph_capture_supported: forward_path_graph_capture_supported(path),
             }
         }
@@ -4532,7 +4555,9 @@ mod tests {
                 max_position: 512,
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
-                dtype: "float32".to_string(),
+                partial_rotary_factor: 1.0,
+                rope_scaling: None,
+                dtype: rvllm_core::types::Dtype::Float32,
                 architecture: "LlamaForCausalLM".to_string(),
             };
             let runner = GpuModelRunner { config };
@@ -4558,7 +4583,9 @@ mod tests {
                 max_position: 2048,
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
-                dtype: "float16".to_string(),
+                partial_rotary_factor: 1.0,
+                rope_scaling: None,
+                dtype: rvllm_core::types::Dtype::Float16,
                 architecture: "LlamaForCausalLM".to_string(),
             };
             let runner = GpuModelRunner { config };

@@ -18,9 +18,9 @@ mod inner {
 
     use rvllm_block_manager::{BlockManager, MemoryPool};
     use rvllm_config::{resolve_runtime_max_model_len, EngineConfig};
-use rvllm_core::prelude::{
-        BlockId, FinishReason, LLMError, LogProb, RequestId, RequestOutput, ResponseFormat,
-        Result, SamplingParams, SequenceId, TokenId,
+    use rvllm_core::prelude::{
+        BlockId, FinishReason, LLMError, LogProb, RequestId, RequestOutput, ResponseFormat, Result,
+        SamplingParams, SequenceId, TokenId,
     };
     use rvllm_model_loader::gguf::inspect_gguf_model_info;
     use rvllm_model_loader::{detect_format, ModelFormat};
@@ -62,6 +62,7 @@ use rvllm_core::prelude::{
         attn_logit_softcapping: f32,
         num_local_experts: usize,
         num_experts_per_tok: usize,
+        rope_scaling: Option<rvllm_model_runner::RopeScalingConfig>,
     }
 
     fn resolve_model_dir(model_name: &str) -> Result<PathBuf> {
@@ -119,6 +120,7 @@ use rvllm_core::prelude::{
                 attn_logit_softcapping: 0.0,
                 num_local_experts: info.expert_count.unwrap_or(0),
                 num_experts_per_tok: info.expert_used_count.unwrap_or(0),
+                rope_scaling: None,
             });
         }
 
@@ -190,6 +192,23 @@ use rvllm_core::prelude::{
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
 
+        let rope_scaling = json.get("rope_scaling").and_then(|v| {
+            let o = v.as_object()?;
+            let rope_type = o.get("rope_type")?.as_str()?.to_string();
+            let factor = o.get("factor")?.as_f64()? as f32;
+            let low_freq_factor = o.get("low_freq_factor")?.as_f64()? as f32;
+            let high_freq_factor = o.get("high_freq_factor")?.as_f64()? as f32;
+            let original_max_position_embeddings =
+                o.get("original_max_position_embeddings")?.as_u64()? as usize;
+            Some(rvllm_model_runner::RopeScalingConfig {
+                rope_type,
+                factor,
+                low_freq_factor,
+                high_freq_factor,
+                original_max_position_embeddings,
+            })
+        });
+
         Ok(HfModelConfig {
             hidden_size,
             intermediate_size: get_usize("intermediate_size", 11008),
@@ -207,6 +226,7 @@ use rvllm_core::prelude::{
             attn_logit_softcapping: get_f32("attn_logit_softcapping", 0.0),
             num_local_experts: get_usize("num_local_experts", 0),
             num_experts_per_tok: get_usize("num_experts_per_tok", 0),
+            rope_scaling,
         })
     }
 
@@ -402,6 +422,7 @@ use rvllm_core::prelude::{
                 num_experts_per_tok: hf_config.num_experts_per_tok,
                 kv_cache_dtype: config.cache.kv_cache_dtype.clone(),
                 enable_prefix_caching: config.cache.enable_prefix_caching,
+                rope_scaling: hf_config.rope_scaling.clone(),
             };
 
             // 5. Create GPU worker
@@ -488,6 +509,11 @@ use rvllm_core::prelude::{
                 request_queue: None,
                 abort_queue: None,
             })
+        }
+
+        /// Mean-pooled L2-normalized embedding (`LlamaBidirectionalModel` native path).
+        pub fn embed(&self, token_ids: &[u32]) -> Result<Vec<f32>> {
+            self.worker.compute_embedding(token_ids)
         }
 
         pub fn add_request(
@@ -602,10 +628,11 @@ use rvllm_core::prelude::{
         /// launched, None if nothing to schedule. GPU computes asynchronously
         /// after this returns (~60us for graph replay path).
         pub fn step_launch(&mut self) -> Result<Option<StepPending>> {
-            let (scheduled_groups, metadata, aborted_seqs, use_decode_batch) = match self.prepare_step() {
-                Some(v) => v,
-                None => return Ok(None),
-            };
+            let (scheduled_groups, metadata, aborted_seqs, use_decode_batch) =
+                match self.prepare_step() {
+                    Some(v) => v,
+                    None => return Ok(None),
+                };
 
             if !aborted_seqs.is_empty() {
                 for scheduled in &scheduled_groups {
@@ -707,13 +734,14 @@ use rvllm_core::prelude::{
         ) -> Result<Vec<RequestOutput>> {
             let prof = std::env::var("RVLLM_PROFILE").is_ok();
             let ts = std::time::Instant::now();
-            let (scheduled_groups, metadata, aborted_seqs, use_decode_batch) = match self.prepare_step() {
-                Some(v) => v,
-                None => {
-                    during_gpu();
-                    return Ok(Vec::new());
-                }
-            };
+            let (scheduled_groups, metadata, aborted_seqs, use_decode_batch) =
+                match self.prepare_step() {
+                    Some(v) => v,
+                    None => {
+                        during_gpu();
+                        return Ok(Vec::new());
+                    }
+                };
             let t_sched = ts.elapsed();
 
             if !aborted_seqs.is_empty() {
@@ -777,10 +805,11 @@ use rvllm_core::prelude::{
         }
 
         pub fn step_old(&mut self) -> Result<Vec<RequestOutput>> {
-            let (scheduled_groups, metadata, aborted_seqs, use_decode_batch) = match self.prepare_step() {
-                Some(v) => v,
-                None => return Ok(Vec::new()),
-            };
+            let (scheduled_groups, metadata, aborted_seqs, use_decode_batch) =
+                match self.prepare_step() {
+                    Some(v) => v,
+                    None => return Ok(Vec::new()),
+                };
 
             if !aborted_seqs.is_empty() {
                 for scheduled in &scheduled_groups {
@@ -848,10 +877,11 @@ use rvllm_core::prelude::{
         }
 
         fn step_count_tokens_only(&mut self) -> Result<(usize, usize)> {
-            let (scheduled_groups, metadata, aborted_seqs, use_decode_batch) = match self.prepare_step() {
-                Some(v) => v,
-                None => return Ok((0, 0)),
-            };
+            let (scheduled_groups, metadata, aborted_seqs, use_decode_batch) =
+                match self.prepare_step() {
+                    Some(v) => v,
+                    None => return Ok((0, 0)),
+                };
 
             if !aborted_seqs.is_empty() {
                 for scheduled in &scheduled_groups {
@@ -902,7 +932,10 @@ use rvllm_core::prelude::{
             let scheduled_groups = scheduled.scheduled_seq_groups;
             let use_decode_batch = scheduled_groups.iter().all(|g| !g.is_prefill);
             let (metadata, aborted_seqs) = if use_decode_batch {
-                (Vec::new(), self.build_decode_batch_descriptor(&scheduled_groups))
+                (
+                    Vec::new(),
+                    self.build_decode_batch_descriptor(&scheduled_groups),
+                )
             } else {
                 self.build_metadata(&scheduled_groups)
             };
@@ -998,12 +1031,7 @@ use rvllm_core::prelude::{
                                 (None, 0.0)
                             };
                         if !scheduled.is_prefill {
-                            Self::sync_decode_seq_data(
-                                req,
-                                seq_idx,
-                                *token_id,
-                                cumulative_logprob,
-                            );
+                            Self::sync_decode_seq_data(req, seq_idx, *token_id, cumulative_logprob);
                             if let Some(block_table) = self.scheduler.get_block_table(seq.seq_id) {
                                 Self::sync_decode_block_table(req, seq_idx, block_table);
                             }
@@ -1131,12 +1159,7 @@ use rvllm_core::prelude::{
                                 (None, 0.0)
                             };
                         if !scheduled.is_prefill {
-                            Self::sync_decode_seq_data(
-                                req,
-                                seq_idx,
-                                *token_id,
-                                cumulative_logprob,
-                            );
+                            Self::sync_decode_seq_data(req, seq_idx, *token_id, cumulative_logprob);
                         }
                         if let Some(reason) = finish_reason {
                             let status = match reason {
@@ -1168,7 +1191,12 @@ use rvllm_core::prelude::{
             let total_tokens: usize = finished_ids
                 .iter()
                 .filter_map(|id| self.requests.get(id))
-                .map(|req| req.seq_states.iter().map(|s| s.token_ids.len()).sum::<usize>())
+                .map(|req| {
+                    req.seq_states
+                        .iter()
+                        .map(|s| s.token_ids.len())
+                        .sum::<usize>()
+                })
                 .sum();
 
             for id in &finished_ids {
@@ -1280,8 +1308,7 @@ use rvllm_core::prelude::{
 
                     let seq_len = seq_data.seq_len as usize;
                     let block_idx = (seq_len.saturating_sub(1)) / self.config.cache.block_size;
-                    let block_offset =
-                        (seq_len.saturating_sub(1)) % self.config.cache.block_size;
+                    let block_offset = (seq_len.saturating_sub(1)) % self.config.cache.block_size;
                     let slot = if block_idx < existing.len() {
                         existing[block_idx].0 * self.config.cache.block_size as u32
                             + block_offset as u32
@@ -1295,7 +1322,9 @@ use rvllm_core::prelude::{
                         .sampling_params
                         .push(sampling_params.clone());
                     self.decode_batch.token_ids.push(seq_data.last_token_id);
-                    self.decode_batch.position_ids.push(seq_len.saturating_sub(1) as u32);
+                    self.decode_batch
+                        .position_ids
+                        .push(seq_len.saturating_sub(1) as u32);
                     self.decode_batch.slot_mapping.push(slot);
                     self.decode_batch.context_lens.push(seq_data.seq_len);
                     self.decode_batch.query_lens.push(1);
@@ -1405,7 +1434,8 @@ use rvllm_core::prelude::{
                             }
                         } else {
                             decode_seq_data.unwrap_or_else(|| {
-                                let seq_len = seq.prompt_token_ids.len() + seq.output_token_ids.len();
+                                let seq_len =
+                                    seq.prompt_token_ids.len() + seq.output_token_ids.len();
                                 let last_token_id = seq
                                     .output_token_ids
                                     .last()

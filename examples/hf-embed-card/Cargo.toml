@@ -1,0 +1,18 @@
+[package]
+name = "hf-embed-card"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "hf-embed-card"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap = { workspace = true, features = ["derive"] }
+rvllm-config.workspace = true
+rvllm-core.workspace = true
+rvllm-engine = { workspace = true, features = ["cuda"] }
+rvllm-tokenizer.workspace = true

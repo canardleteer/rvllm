@@ -32,16 +32,16 @@ struct LlamaConfig {
     rms_norm_eps: f32,
 }
 
-struct LlamaLayer {
-    input_layernorm: GpuBuffer<f16>,
-    post_attention_layernorm: GpuBuffer<f16>,
-    q_proj: GpuBuffer<f16>,
-    k_proj: GpuBuffer<f16>,
-    v_proj: GpuBuffer<f16>,
-    o_proj: GpuBuffer<f16>,
-    gate_proj: GpuBuffer<f16>,
-    up_proj: GpuBuffer<f16>,
-    down_proj: GpuBuffer<f16>,
+pub(crate) struct LlamaLayer {
+    pub(crate) input_layernorm: GpuBuffer<f16>,
+    pub(crate) post_attention_layernorm: GpuBuffer<f16>,
+    pub(crate) q_proj: GpuBuffer<f16>,
+    pub(crate) k_proj: GpuBuffer<f16>,
+    pub(crate) v_proj: GpuBuffer<f16>,
+    pub(crate) o_proj: GpuBuffer<f16>,
+    pub(crate) gate_proj: GpuBuffer<f16>,
+    pub(crate) up_proj: GpuBuffer<f16>,
+    pub(crate) down_proj: GpuBuffer<f16>,
 }
 
 impl LlamaForCausalLM {

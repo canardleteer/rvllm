@@ -13,7 +13,7 @@ mod inner {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc as std_mpsc;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use tokio::sync::{mpsc, oneshot};
     use tokio_stream::wrappers::ReceiverStream;
@@ -65,6 +65,10 @@ mod inner {
 
     enum GpuWork {
         Step,
+        Embed {
+            token_ids: Vec<u32>,
+            reply: std_mpsc::Sender<Result<Vec<f32>>>,
+        },
         Shutdown,
     }
 
@@ -93,6 +97,8 @@ mod inner {
         cmd_tx: mpsc::Sender<GpuEngineCommand>,
         gen_tx: mpsc::Sender<GpuEngineRequest>,
         cancel: CancellationToken,
+        /// Shared with the GPU thread; all work (step + embed) is FIFO ordered.
+        gpu_work_tx: Arc<Mutex<std_mpsc::Sender<GpuWork>>>,
     }
 
     impl Clone for AsyncGpuLLMEngine {
@@ -103,6 +109,7 @@ mod inner {
                 // Clone the token for sending, but DON'T cancel on drop of clones.
                 // Only the original (via explicit shutdown()) should cancel.
                 cancel: self.cancel.clone(),
+                gpu_work_tx: self.gpu_work_tx.clone(),
             }
         }
     }
@@ -114,14 +121,18 @@ mod inner {
         /// a dedicated OS thread for GPU work, and a tokio task to bridge
         /// the async channels.
         pub async fn new(config: EngineConfig) -> Result<Self> {
-            let mut engine = GpuLLMEngine::new(config)?;
+            let engine = GpuLLMEngine::new(config)?;
+            let (gpu_tx, gpu_rx) = std_mpsc::channel::<GpuWork>();
+            let gpu_work_tx = Arc::new(Mutex::new(gpu_tx));
             let cancel = CancellationToken::new();
             let (cmd_tx, cmd_rx) = mpsc::channel::<GpuEngineCommand>(256);
             let (gen_tx, gen_rx) = mpsc::channel::<GpuEngineRequest>(256);
 
             let cancel_bg = cancel.clone();
+            let gpu_work_tx_bg = gpu_work_tx.clone();
             tokio::spawn(async move {
-                Self::background_loop(engine, cmd_rx, gen_rx, cancel_bg).await;
+                Self::background_loop(engine, cmd_rx, gen_rx, cancel_bg, gpu_work_tx_bg, gpu_rx)
+                    .await;
             });
 
             info!("AsyncGpuLLMEngine started background task + GPU thread");
@@ -129,7 +140,28 @@ mod inner {
                 cmd_tx,
                 gen_tx,
                 cancel,
+                gpu_work_tx,
             })
+        }
+
+        /// Native embedding forward (`LlamaBidirectionalModel`), serialized with generation steps.
+        pub async fn compute_embedding_vec(&self, token_ids: Vec<u32>) -> Result<Vec<f32>> {
+            let (reply_tx, reply_rx) = std_mpsc::channel();
+            {
+                let tx = self
+                    .gpu_work_tx
+                    .lock()
+                    .map_err(|_| LLMError::GpuError("gpu work mutex poisoned".into()))?;
+                tx.send(GpuWork::Embed {
+                    token_ids,
+                    reply: reply_tx,
+                })
+                .map_err(|_| LLMError::GpuError("GPU thread stopped".into()))?;
+            }
+            let recv_result = tokio::task::spawn_blocking(move || reply_rx.recv())
+                .await
+                .map_err(|_| LLMError::GpuError("embed task join failed".into()))?;
+            recv_result.map_err(|_| LLMError::GpuError("embed reply channel closed".into()))?
         }
 
         /// Submit a generation request and receive a stream of incremental outputs.
@@ -218,22 +250,21 @@ mod inner {
             mut cmd_rx: mpsc::Receiver<GpuEngineCommand>,
             mut gen_rx: mpsc::Receiver<GpuEngineRequest>,
             cancel: CancellationToken,
+            gpu_work_tx: Arc<Mutex<std_mpsc::Sender<GpuWork>>>,
+            gpu_rx: std_mpsc::Receiver<GpuWork>,
         ) {
-            let mut output_channels: HashMap<RequestId, OutputSink> =
-                HashMap::new();
+            let mut output_channels: HashMap<RequestId, OutputSink> = HashMap::new();
             let next_request_id: Arc<AtomicU64> = engine.request_id_counter();
 
             // Shared queues: async loop pushes, GPU engine drains during step().
             let request_queue: RequestQueue =
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-            let abort_queue: AbortQueue =
-                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let abort_queue: AbortQueue = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             engine.set_request_queue(request_queue.clone());
             engine.set_abort_queue(abort_queue.clone());
 
             // Spawn dedicated GPU thread.
             // Communication: async loop sends GpuWork, GPU thread sends back GpuStepResult.
-            let (gpu_tx, gpu_rx) = std_mpsc::channel::<GpuWork>();
             // Use tokio::sync::mpsc for results so we can .await instead of spin+yield
             let (result_tx, mut result_rx) = mpsc::channel::<GpuStepResult>(4);
 
@@ -308,7 +339,11 @@ mod inner {
                 }
 
                 // -- Send step to GPU thread (non-blocking send) --
-                if gpu_tx.send(GpuWork::Step).is_err() {
+                let send_step = {
+                    let tx = gpu_work_tx.lock().unwrap();
+                    tx.send(GpuWork::Step)
+                };
+                if send_step.is_err() {
                     error!("GPU thread died unexpectedly");
                     break;
                 }
@@ -317,17 +352,22 @@ mod inner {
                 let result = result_rx.recv().await;
                 // GPU done. Drain any requests that arrived during compute.
                 Self::drain_commands_to_queue(
-                    &mut cmd_rx, &request_queue, &abort_queue, &mut output_channels,
+                    &mut cmd_rx,
+                    &request_queue,
+                    &abort_queue,
+                    &mut output_channels,
                 );
                 Self::drain_generate_requests_to_queue(
-                    &mut gen_rx, &request_queue, &mut output_channels, &next_request_id,
+                    &mut gen_rx,
+                    &request_queue,
+                    &mut output_channels,
+                    &next_request_id,
                 );
                 match result {
                     Some(result) => {
                         has_unfinished = result.has_unfinished;
-                        Self::send_outputs(
-                            result.outputs, &mut output_channels, &abort_queue,
-                        ).await;
+                        Self::send_outputs(result.outputs, &mut output_channels, &abort_queue)
+                            .await;
                     }
                     None => {
                         error!("GPU thread result channel disconnected");
@@ -337,7 +377,7 @@ mod inner {
             }
 
             // Shutdown the GPU thread
-            let _ = gpu_tx.send(GpuWork::Shutdown);
+            let _ = gpu_work_tx.lock().map(|tx| tx.send(GpuWork::Shutdown));
             if let Err(e) = gpu_thread.join() {
                 error!("GPU thread panicked: {:?}", e);
             }
@@ -366,12 +406,19 @@ mod inner {
                     GpuWork::Step => {
                         let outputs = engine.step();
                         let unfinished = engine.has_unfinished();
-                        if result_tx.blocking_send(GpuStepResult {
-                            outputs,
-                            has_unfinished: unfinished,
-                        }).is_err() {
+                        if result_tx
+                            .blocking_send(GpuStepResult {
+                                outputs,
+                                has_unfinished: unfinished,
+                            })
+                            .is_err()
+                        {
                             break;
                         }
+                    }
+                    GpuWork::Embed { token_ids, reply } => {
+                        let r = engine.embed(&token_ids);
+                        let _ = reply.send(r);
                     }
                     GpuWork::Shutdown => break,
                 }
@@ -448,12 +495,9 @@ mod inner {
         ) {
             loop {
                 match gen_rx.try_recv() {
-                    Ok(req) => Self::handle_generate_to_queue(
-                        req,
-                        request_queue,
-                        output_channels,
-                        next_id,
-                    ),
+                    Ok(req) => {
+                        Self::handle_generate_to_queue(req, request_queue, output_channels, next_id)
+                    }
                     Err(_) => break,
                 }
             }
